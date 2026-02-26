@@ -1,7 +1,9 @@
 # Server (Go + PostgreSQL) — Local + EC2 + ECR
 
 This repo contains a Go HTTP API server with PostgreSQL persistence, plus Docker workflows for:
+
 - Local development (Docker Postgres)
+- Running the API locally (Go)
 - Containerizing the API (Dockerfile)
 - Pushing/pulling the API image to/from Amazon ECR
 - Running the API + Postgres on an EC2 instance
@@ -32,10 +34,14 @@ server/
 
 ## Environment Variables
 
-Example `.env` (local or EC2):
+Example `.env` (local):
 
 ```env
 PORT=8080
+
+# Auth (Go middleware requires this)
+API_TOKEN=your_long_random_token
+
 POSTGRES_USER=appuser
 POSTGRES_PASSWORD=apppass
 POSTGRES_DB=appdb
@@ -45,25 +51,38 @@ POSTGRES_PORT=5432
 # - If API runs on your laptop and Postgres is Docker on your laptop: POSTGRES_HOST=localhost
 # - If API runs in Docker and Postgres runs in Docker: POSTGRES_HOST=<postgres container name>
 # - If using RDS: POSTGRES_HOST=<rds endpoint>
+POSTGRES_HOST=localhost
 ```
+
+On EC2, store secrets in `/etc/myapi/myapi.env` (recommended) instead of committing them.
 
 ---
 
-## Conenction to EC2
+## Connect to EC2
+
 ```bash
 chmod 400 your-key.pem
 ssh -i your-key.pem USERNAME@PUBLIC_DNS_OR_IP
 ```
 
+---
+
 ## Local: Run PostgreSQL in Docker
+
+From `server/`:
 
 ```bash
 docker volume create pgdata
 
-docker run -d   --name IaaSDemoPostgres   --env-file .env   -p 5432:5432   -v pgdata:/var/lib/postgresql/data   postgres:16
+docker run -d \
+  --name IaaSDemoPostgres \
+  --env-file .env \
+  -p 5432:5432 \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16
 ```
 
-Run migration (if file exists locally in `server/sql/`):
+### Run migration (file-based)
 
 ```bash
 docker exec -i IaaSDemoPostgres psql -U appuser -d appdb < sql/V001_create_users.sql
@@ -86,13 +105,19 @@ go run ./main
 ## API Endpoints
 
 ### Create user
+
 ```bash
-curl -i -X POST "http://localhost:8080/api/v1/user/create"   -H "Content-Type: application/json"   -d '{"name":"Teck","age":21,"department":"Engineering"}'
+curl -i -X POST "http://localhost:8080/api/v1/user/create" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -d '{"name":"Teck","age":21,"department":"Engineering"}'
 ```
 
 ### Get user by id
+
 ```bash
-curl -i "http://localhost:8080/api/v1/user/get?id=1"
+curl -i -H "Authorization: Bearer $API_TOKEN" \
+  "http://localhost:8080/api/v1/user/get?id=1"
 ```
 
 ---
@@ -108,42 +133,59 @@ docker build -t iaas-demo-server:latest .
 Run the API container:
 
 ```bash
-docker run -d   --name iaas-demo-server   --env-file .env   -p 8080:8080   iaas-demo-server:latest
+docker run -d \
+  --name iaas-demo-server \
+  --env-file .env \
+  -p 8080:8080 \
+  iaas-demo-server:latest
 ```
 
 ---
 
 ## Amazon ECR (Push / Pull)
 
-ECR stores your **API image**. `docker-compose.yml` is not pushed to ECR.
+ECR stores your API image. `docker-compose.yml` is not pushed to ECR.
 
 Repo used in this setup:
 
-```
-202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server
-```
+`202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server`
 
 ### Login to ECR (laptop)
+
 ```bash
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 202533502060.dkr.ecr.us-east-1.amazonaws.com
+aws ecr get-login-password --region us-east-1 \
+| docker login --username AWS --password-stdin 202533502060.dkr.ecr.us-east-1.amazonaws.com
 ```
 
 ### Build + push (recommended: multi-arch)
+
 This avoids Apple Silicon (arm64) vs EC2 (amd64) mismatch.
 
 ```bash
 cd server
 docker buildx create --use
-docker buildx build --platform linux/amd64,linux/arm64   -t 202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server:latest   --push .
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t 202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server:latest \
+  --push .
 ```
 
-### Pull on EC2
+---
+
+## Pull on EC2
+
 On EC2, the instance should have an IAM Role with `AmazonEC2ContainerRegistryReadOnly`.
 
 ```bash
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 202533502060.dkr.ecr.us-east-1.amazonaws.com
+aws ecr get-login-password --region us-east-1 \
+| sudo docker login --username AWS --password-stdin 202533502060.dkr.ecr.us-east-1.amazonaws.com
 
-docker pull 202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server:latest
+sudo docker pull 202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server:latest
+```
+
+If you hit an architecture warning (arm64 vs amd64), pull with:
+
+```bash
+sudo docker pull --platform linux/amd64 202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server:latest
 ```
 
 ---
@@ -151,20 +193,30 @@ docker pull 202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server:latest
 ## EC2: Run API + Postgres (both in Docker)
 
 ### 1) Create a Docker network
+
 ```bash
-docker network create iaas-net
+sudo docker network create iaas-net
 ```
 
 ### 2) Run Postgres container (on the same network)
-```bash
-docker volume create pgdata
 
-docker run -d   --name iaas-demo-postgres   --network iaas-net   -e POSTGRES_USER=appuser   -e POSTGRES_PASSWORD=apppass   -e POSTGRES_DB=appdb   -v pgdata:/var/lib/postgresql/data   postgres:16
+```bash
+sudo docker volume create pgdata
+
+sudo docker run -d \
+  --name iaas-demo-postgres \
+  --network iaas-net \
+  -e POSTGRES_USER=appuser \
+  -e POSTGRES_PASSWORD=apppass \
+  -e POSTGRES_DB=appdb \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16
 ```
 
-### 3) Run migration (inline, no file needed)
+### 3) Run migration (inline)
+
 ```bash
-docker exec -i iaas-demo-postgres psql -U appuser -d appdb <<'SQL'
+sudo docker exec -i iaas-demo-postgres psql -U appuser -d appdb <<'SQL'
 CREATE TABLE IF NOT EXISTS users (
   id BIGSERIAL PRIMARY KEY,
   name TEXT NOT NULL,
@@ -175,29 +227,112 @@ SQL
 ```
 
 ### 4) Run API container from ECR (same network)
+
 Map EC2 port 80 -> container 8080:
 
 ```bash
-docker run -d   --name iaas-demo-server   --network iaas-net   -e PORT=8080   -e POSTGRES_HOST=iaas-demo-postgres   -e POSTGRES_PORT=5432   -e POSTGRES_USER=appuser   -e POSTGRES_PASSWORD=apppass   -e POSTGRES_DB=appdb   -p 80:8080   --restart unless-stopped   202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server:latest
+sudo docker rm -f iaas-demo-server 2>/dev/null || true
+
+sudo docker run -d \
+  --name iaas-demo-server \
+  --network iaas-net \
+  --restart unless-stopped \
+  --env-file /etc/myapi/myapi.env \
+  -e PORT=8080 \
+  -e POSTGRES_HOST=iaas-demo-postgres \
+  -e POSTGRES_PORT=5432 \
+  -e POSTGRES_USER=appuser \
+  -e POSTGRES_PASSWORD=apppass \
+  -e POSTGRES_DB=appdb \
+  -p 80:8080 \
+  202533502060.dkr.ecr.us-east-1.amazonaws.com/iaas_demo_server:latest
 ```
 
-### 5) Test on EC2
+---
+
+## Test on EC2 (local)
+
 ```bash
-curl -i -X POST "http://localhost/api/v1/user/create"   -H "Content-Type: application/json"   -d '{"name":"Alice","age":22,"department":"HR"}'
+API_TOKEN=$(sudo awk -F= '/^API_TOKEN=/{print $2}' /etc/myapi/myapi.env)
 
 curl -i "http://localhost/api/v1/user/get?id=1"
+# Expect 401
+
+curl -i -H "Authorization: Bearer $API_TOKEN" \
+  "http://localhost/api/v1/user/get?id=1"
+# Expect 200
 ```
 
-### 6) Test from your laptop (public)
+Create user:
+
+```bash
+curl -i -X POST "http://localhost/api/v1/user/create" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -d '{"name":"Alice","age":22,"department":"HR"}'
+```
+
+---
+
+## Test from your laptop (public)
+
 Replace with your EC2 public IP:
 
 ```bash
-curl -i -X POST "http://EC2_PUBLIC_IP/api/v1/user/create"   -H "Content-Type: application/json"   -d '{"name":"Bob","age":25,"department":"Sales"}'
+API_TOKEN="your_token_here"
 
-curl -i "http://EC2_PUBLIC_IP/api/v1/user/get?id=1"
+curl -i -H "Authorization: Bearer $API_TOKEN" \
+  "http://EC2_PUBLIC_IP/api/v1/user/get?id=1"
 ```
 
-EC2 Security Group must allow inbound **HTTP (80)** from `0.0.0.0/0`.
+EC2 Security Group must allow inbound HTTP (80) from `0.0.0.0/0`.
+
+---
+
+## Stop / Start / Restart Containers (EC2)
+
+### Check what’s running
+
+```bash
+sudo docker ps
+sudo docker ps -a
+```
+
+### Stop containers
+
+```bash
+sudo docker stop iaas-demo-server iaas-demo-postgres
+```
+
+### Start containers again (no re-run needed)
+
+```bash
+sudo docker start iaas-demo-postgres iaas-demo-server
+```
+
+### Restart containers
+
+```bash
+sudo docker restart iaas-demo-postgres iaas-demo-server
+```
+
+### Stop everything
+
+```bash
+sudo docker ps -q | xargs -r sudo docker stop
+```
+
+### Remove containers (keeps images)
+
+```bash
+sudo docker rm -f iaas-demo-server iaas-demo-postgres
+```
+
+### Remove images (dangerous)
+
+```bash
+sudo docker rmi -f $(sudo docker images -aq)
+```
 
 ---
 
@@ -244,6 +379,7 @@ volumes:
 ```
 
 Run:
+
 ```bash
 docker compose up -d postgres
 docker compose run --rm migrate
@@ -254,30 +390,21 @@ docker compose run --rm migrate
 ## Useful Docker Commands
 
 Check containers:
+
 ```bash
-docker ps
-docker ps -a
+sudo docker ps
+sudo docker ps -a
 ```
 
 Logs:
-```bash
-docker logs -f iaas-demo-server
-docker logs -f iaas-demo-postgres
-```
 
-Remove containers:
 ```bash
-docker rm -f iaas-demo-server iaas-demo-postgres
-```
-
-Remove all containers/images (dangerous):
-```bash
-docker rm -f $(docker ps -aq)
-docker rmi -f $(docker images -aq)
+sudo docker logs -f iaas-demo-server
+sudo docker logs -f iaas-demo-postgres
 ```
 
 Exit EC2 SSH session:
+
 ```bash
 exit
 ```
-
