@@ -49,6 +49,12 @@ POSTGRES_PORT=5432
 
 ---
 
+## Conenction to EC2
+```bash
+chmod 400 your-key.pem
+ssh -i your-key.pem USERNAME@PUBLIC_DNS_OR_IP
+```
+
 ## Local: Run PostgreSQL in Docker
 
 ```bash
